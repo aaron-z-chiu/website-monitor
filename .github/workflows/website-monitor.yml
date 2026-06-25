@@ -19,7 +19,7 @@ jobs:
 
           URL="https://zecqiu.com"
           HOST="zecqiu.com"
-          KEYWORD="Zecheng"
+          KEYWORD="Zecheng_Li_zhang"
           WARN_DAYS=14
 
           GITHUB_PAGES_IPS=(
