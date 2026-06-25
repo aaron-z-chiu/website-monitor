@@ -1,0 +1,119 @@
+name: Website monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check website and notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set +e
+
+          URL="https://zecqiu.com"
+          HOST="zecqiu.com"
+          KEYWORD="Zecheng"
+          WARN_DAYS=14
+
+          GITHUB_PAGES_IPS=(
+            "185.199.108.153"
+            "185.199.109.153"
+            "185.199.110.153"
+            "185.199.111.153"
+          )
+
+          FAILURES=""
+
+          notify() {
+            local text="$1"
+            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${text}" >/dev/null
+          }
+
+          add_failure() {
+            FAILURES="${FAILURES}
+          - $1"
+          }
+
+          # 1. Visitor-level HTTPS + content check.
+          BODY=$(mktemp)
+          CURL_ERR=$(mktemp)
+          HTTP_CODE=$(curl -L --connect-timeout 10 --max-time 30 -sS \
+            -o "$BODY" -w "%{http_code}" "$URL" 2>"$CURL_ERR")
+          CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            add_failure "Visitor HTTPS check failed. curl exit=${CURL_EXIT}, error=$(cat "$CURL_ERR")"
+          elif [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
+            add_failure "Visitor HTTP status abnormal. HTTP=${HTTP_CODE}"
+          elif ! grep -qi "$KEYWORD" "$BODY"; then
+            add_failure "Visitor page loaded but expected keyword '${KEYWORD}' was not found."
+          fi
+
+          # 2. Public TLS certificate expiry check.
+          CERT_END=$(echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null \
+            | openssl x509 -noout -enddate 2>/dev/null \
+            | sed 's/notAfter=//')
+
+          if [ -z "$CERT_END" ]; then
+            add_failure "Could not read public TLS certificate expiry."
+          else
+            CERT_END_EPOCH=$(date -u -d "$CERT_END" +%s 2>/dev/null)
+            NOW_EPOCH=$(date -u +%s)
+            DAYS_LEFT=$(( (CERT_END_EPOCH - NOW_EPOCH) / 86400 ))
+
+            if [ "$DAYS_LEFT" -lt 0 ]; then
+              add_failure "Public TLS certificate has expired. notAfter=${CERT_END}"
+            elif [ "$DAYS_LEFT" -lt "$WARN_DAYS" ]; then
+              add_failure "Public TLS certificate expires soon. days_left=${DAYS_LEFT}, notAfter=${CERT_END}"
+            fi
+          fi
+
+          # 3. Direct GitHub Pages origin check, bypassing Cloudflare.
+          ORIGIN_OK=0
+          ORIGIN_LAST_ERROR=""
+
+          for IP in "${GITHUB_PAGES_IPS[@]}"; do
+            ORIGIN_BODY=$(mktemp)
+            ORIGIN_ERR=$(mktemp)
+
+            ORIGIN_CODE=$(curl -L --resolve "${HOST}:443:${IP}" \
+              --connect-timeout 10 --max-time 30 -sS \
+              -o "$ORIGIN_BODY" -w "%{http_code}" "https://${HOST}" 2>"$ORIGIN_ERR")
+            ORIGIN_EXIT=$?
+
+            if [ "$ORIGIN_EXIT" -eq 0 ] && [ "$ORIGIN_CODE" -ge 200 ] && [ "$ORIGIN_CODE" -lt 400 ] && grep -qi "$KEYWORD" "$ORIGIN_BODY"; then
+              ORIGIN_OK=1
+              break
+            fi
+
+            ORIGIN_LAST_ERROR="ip=${IP}, exit=${ORIGIN_EXIT}, http=${ORIGIN_CODE}, error=$(cat "$ORIGIN_ERR")"
+          done
+
+          if [ "$ORIGIN_OK" -ne 1 ]; then
+            add_failure "GitHub Pages origin direct check failed. Last error: ${ORIGIN_LAST_ERROR}"
+          fi
+
+          if [ -n "$FAILURES" ]; then
+            NOW=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
+            MESSAGE="🚨 Website monitor alert
+
+          URL: ${URL}
+          Time: ${NOW}
+
+          Problems:${FAILURES}"
+
+            notify "$MESSAGE"
+            echo "$MESSAGE"
+            exit 1
+          fi
+
+          echo "Website OK: ${URL}"
